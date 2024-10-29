@@ -145,7 +145,11 @@ def calculate(poi, case_data, flow_data, ds=1, dt=1, taus=1, taut=3,
                                    t_type = t_type, remove_na=remove_na)
     else:
         embedding = poi
-    entropy = ordpy.permutation_entropy(embedding, dx=ds+dt-1, dy=1, normalized=normalize)
+    if t_type == "2d":
+        embed_dim = ds*dt
+    if t_type== "1d":
+        embed_dim = ds+dt-1
+    entropy = ordpy.permutation_entropy(embedding, dx=embed_dim, dy=1, normalized=normalize)
     return entropy
 
 ############################ Accessory Functions #############################
