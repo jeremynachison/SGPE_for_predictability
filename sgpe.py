@@ -9,6 +9,7 @@ from numpy.lib.stride_tricks import sliding_window_view
 import numpy as np
 import pandas as pd
 import ordpy
+import math
 
 def time_embedding_helper(embedding, dt, taut, ds, tshifts, i):
     """
@@ -78,8 +79,83 @@ def make_embedding(poi, case_data, flow_data, ds, dt, taus, taut,
         embedding = embedding[~np.isnan(embedding).any(axis=1)]
     return embedding
 
-def calculate(poi, case_data, flow_data, ds=1, dt=1, taus=1, taut=3, 
-         normalize=True, embedding=False, t_type = "1d", remove_na=True):
+    
+
+def exhaustive_optimal_hyperparams(cases_df, center_data,
+                             ds_vals = list(range(2,11)), 
+                             dt_vals = list(range(2,11)),
+                             taus_vals = list(range(1,6)),
+                             taut_vals =  list(range(1,7))):
+    """
+    Exhaustive search for optimal hyperparameters
+    """
+    # Make dataframe holding all possible hyperparameter combos
+    hyper_params = pd.DataFrame({"ds": ds_vals}).merge(
+        pd.DataFrame({"dt": dt_vals}), how="cross").merge(
+            pd.DataFrame({"taus": taus_vals}), how="cross").merge(
+                pd.DataFrame({"taut": taut_vals}), how="cross")
+    # Discard combos we know will have too high embedding dimension
+    hyper_params = hyper_params[hyper_params[['ds', 'dt']].sum(axis=1)<=10] 
+    # Helper function
+    def calculate_rowwise(row, case_data=cases_df, center_data=center_data):
+        entropy = case_data.apply(lambda x: calculate(x.name, cases_df, 
+                                                          center_data, ds=row["ds"], dt=row["dt"],
+                                                          taut=row["taut"],taus=row["taus"],t_type="1d",
+                                                          normalize=False))
+        return np.mean(entropy)
+    hyper_params["entropy_mu"] = hyper_params.apply(calculate_rowwise, axis=1)
+    return hyper_params.loc[hyper_params["entropy_mu"].idxmin()]
+
+def greedy_optimize_hyperparams(cases_df, centers_df, ds_vals = list(range(2,11)), 
+                         dt_vals = list(range(2,11)), 
+                         taus_vals = list(range(1,4)),
+                         taut_vals =  list(range(1,8)),
+                         embedding=False):
+    """
+    Greedy search algorithm for PE hyperparams
+    """
+    # first find ds and dt values
+    hyper_params1 = pd.DataFrame({"ds": ds_vals}).merge(
+        pd.DataFrame({"dt": dt_vals}), how="cross"
+    )
+    hyper_params1 = hyper_params1[hyper_params1[['ds', 'dt']].sum(axis=1)<=10]
+    # then search for delays that can help further lower the PE
+    hyper_params2 = pd.DataFrame({"taus": taus_vals}).merge(
+        pd.DataFrame({"taut": taut_vals}), how="cross"
+    )
+    # helper function to find optimal ds and dt
+    def calculate_embeddim(row, case_data=cases_df, center_data=centers_df):
+        entropy = case_data.apply(lambda x: calculate(x.name, cases_df, 
+                                                          centers_df, 
+                                                          ds=row["ds"], 
+                                                          dt=row["dt"],
+                                                          taut=1,taus=1,
+                                                          t_type="1d",
+                                                          embedding=embedding))
+        return np.mean(entropy)
+    hyper_params1["entropy"] = hyper_params1.apply(calculate_embeddim, axis=1)
+    min_row = hyper_params1.loc[hyper_params1["entropy"].idxmin()]
+    min_ds, min_dt = min_row["ds"], min_row["dt"]
+    # Now optimize taus and taut
+    def calculate_delay(row, min_ds=min_ds, min_dt=min_dt, case_data=cases_df, center_data=centers_df):
+        entropy = case_data.apply(lambda x: calculate(x.name, cases_df, 
+                                                          center_data, 
+                                                          ds=int(min_ds), 
+                                                          dt=int(min_dt),
+                                                          taut=row["taut"],
+                                                          taus=row["taus"],
+                                                          t_type="1d",
+                                                          embedding=embedding))
+        return np.mean(entropy), np.quantile(entropy, 0.25), np.quantile(entropy, 0.75)
+    hyper_params2[["entropy", "entropy_lower", "entropy_upper"]] = pd.DataFrame(
+        hyper_params2.apply(calculate_delay, axis=1).tolist(), index=hyper_params2.index
+    )
+    min_row2 = hyper_params2.loc[hyper_params1["entropy"].idxmin()]
+    min_ds, min_dt = min_row2["taus"], min_row2["taut"]
+    return min_row2["entropy"], min_row2["entropy_lower"], min_row2["entropy_upper"]  
+
+def calculate(poi, case_data, flow_data, ds=1, dt=1, taus=1, taut=1, 
+         normalize=True, embedding=False, t_type = "1d", remove_na=True, ascending=True):
     """
     Calculates the SGPE for a location with specified temporal and spatial 
     embedding vectors.
@@ -142,14 +218,23 @@ def calculate(poi, case_data, flow_data, ds=1, dt=1, taus=1, taut=3,
     """
     if not embedding:
         embedding = make_embedding(poi, case_data, flow_data, ds, dt, taus, taut, 
-                                   t_type = t_type, remove_na=remove_na)
+                                   t_type = t_type, remove_na=remove_na, asc=ascending)
     else:
         embedding = poi
     if t_type == "2d":
         embed_dim = ds*dt
     if t_type== "1d":
         embed_dim = ds+dt-1
-    entropy = ordpy.permutation_entropy(embedding, dx=embed_dim, dy=1, normalized=normalize)
+    # normalization in default includes patterns not appearing in distribution
+    _, distr = ordpy.ordinal_distribution(embedding, dx=embed_dim, dy=1)
+    # normalize by number of patterns that appear, not (embed_dim)!
+    if not normalize:
+        m = np.log2(len(_))
+        entropy = ordpy.permutation_entropy(distr, dx=embed_dim, dy=1, 
+                                            normalized=False, probs=True)/m
+    else:
+        entropy = ordpy.permutation_entropy(distr, dx=embed_dim, dy=1, 
+                                            normalized=True, probs=True)
     return entropy
 
 ############################ Accessory Functions #############################
@@ -167,7 +252,7 @@ def get_window_entropy(arr3d, arg_dict, normalize):
     return window_entropy
 
 def rolling_window(window_size, case_data, flow_data, ds=1,dt=1,taus=1,taut=1,
-                   t_type="1d", normalize=True):
+                   t_type="1d", normalize=True, ascending=True):
     """
     Get the SGPE for each location in case_data across rolling window of length window_size
     
@@ -182,7 +267,7 @@ def rolling_window(window_size, case_data, flow_data, ds=1,dt=1,taus=1,taut=1,
     embedding_series = pd.Series([np.nan]*case_data.shape[1], 
                                  index=np.arange(case_data.shape[1]), dtype=object)
     # 1d series holding 2d embedding matrices, ith entry holds the embedding for location i
-    embedding_series = case_data.apply(lambda x: [make_embedding(x.name, remove_na=False, **arg_dict)])
+    embedding_series = case_data.apply(lambda x: [make_embedding(x.name, remove_na=False, asc=ascending, **arg_dict)])
     # series of 3d arrays, ith entry has shape (nrow(case_data) - window_size +1, window_size, embedding dimension)
     # 2d slices when first axis=i holds the embedding matrix for the ith moving window
     windows = embedding_series.apply(lambda embedding: [np.squeeze(sliding_window_view(embedding[0], 
@@ -192,7 +277,6 @@ def rolling_window(window_size, case_data, flow_data, ds=1,dt=1,taus=1,taut=1,
     # get same index as original data
     window_entropy.index = case_data.index[window_size-1:]
     return window_entropy
-
 
 def shuffle(flow_data, alpha, sort = True):
     """
@@ -208,13 +292,13 @@ def shuffle(flow_data, alpha, sort = True):
     """
     # since flow A -> B the same as flow B -> A, flow_data has duplicate info, make data with only unique A,B flows
     unique_flows = (flow_data[flow_data["origin"].astype(float) < flow_data["destination"].astype(float)]
-                    .reset_index(drop=True))
+                    .reset_index(drop=True).copy())
     # get number of rows to shuffle
     num_shuffled = round(alpha*len(unique_flows))
     # randomly select num_shuffled number of indices from the unique_flows
     shuffled_indices = np.random.choice(unique_flows.index, size=num_shuffled, replace=False)
     # get subset to shuffle
-    subset_df = unique_flows.loc[shuffled_indices]
+    subset_df = unique_flows.loc[shuffled_indices].copy()
     # shuffle the flows in the selected indices
     subset_df.iloc[:, 2] = np.random.permutation(subset_df.iloc[:, 2])
     # replace the flows with their shuffled values for the selected indices
@@ -226,5 +310,16 @@ def shuffle(flow_data, alpha, sort = True):
     if sort:
         original_but_shuffled = original_but_shuffled.sort_values(by=['origin', 'destination']).reset_index(drop=True)
     return original_but_shuffled
+
+
+
+
+
+
+
+
+
+
+
     
 
